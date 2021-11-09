@@ -28,4 +28,7 @@ pub use self::{
         RuntimeGenerator,
     },
     derives::GeneratedTypeDerives,
+    types::{
+        TypeGenerator
+    }
 };

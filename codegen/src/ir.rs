@@ -1,18 +1,6 @@
-// Copyright 2019-2021 Parity Technologies (UK) Ltd.
-// This file is part of subxt.
-//
-// subxt is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// subxt is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with subxt.  If not, see <http://www.gnu.org/licenses/>.
+// Copyright 2019-2022 Parity Technologies (UK) Ltd.
+// This file is dual-licensed as Apache-2.0 or GPL-3.0.
+// see LICENSE for license details.
 
 use proc_macro_error::abort;
 use std::collections::HashMap;
@@ -23,7 +11,6 @@ use syn::{
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ItemMod {
-    // attrs: Vec<syn::Attribute>,
     vis: syn::Visibility,
     mod_token: token::Mod,
     pub ident: syn::Ident,
@@ -74,7 +61,6 @@ impl ItemMod {
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq, Eq)]
-#[allow(clippy::large_enum_variant)]
 pub enum Item {
     Rust(syn::Item),
     Subxt(SubxtItem),
@@ -104,6 +90,26 @@ impl From<syn::Item> for Item {
             if let Some(attr) = substitute_attrs.get(0) {
                 let use_path = &use_.tree;
                 let substitute_with: syn::TypePath = syn::parse_quote!( #use_path );
+
+                let is_crate = substitute_with
+                    .path
+                    .segments
+                    .first()
+                    .map(|segment| segment.ident == "crate")
+                    .unwrap_or(false);
+
+                // Check if the substitute path is a global absolute path, meaning it
+                // is prefixed with `::` or `crate`.
+                //
+                // Note: the leading colon is lost when parsing to `syn::TypePath` via
+                // `syn::parse_quote!`. Therefore, inspect `use_`'s leading colon.
+                if use_.leading_colon.is_none() && !is_crate {
+                    abort!(
+                        use_path.span(),
+                        "The substitute path must be a global absolute path; try prefixing with `::` or `crate`"
+                    )
+                }
+
                 let type_substitute = SubxtItem::TypeSubstitute {
                     generated_type_path: attr.substitute_type(),
                     substitute_with,

@@ -1,29 +1,20 @@
-// Copyright 2019-2021 Parity Technologies (UK) Ltd.
-// This file is part of subxt.
-//
-// subxt is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// subxt is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with subxt.  If not, see <http://www.gnu.org/licenses/>.
+// Copyright 2019-2022 Parity Technologies (UK) Ltd.
+// This file is dual-licensed as Apache-2.0 or GPL-3.0.
+// see LICENSE for license details.
 
-use crate::types::TypeGenerator;
+use crate::{
+    types::TypeGenerator,
+    CratePath,
+};
 use frame_metadata::{
+    v14::RuntimeMetadataV14,
     PalletMetadata,
-    PalletStorageMetadata,
     StorageEntryMetadata,
     StorageEntryModifier,
     StorageEntryType,
     StorageHasher,
 };
-use heck::SnakeCase as _;
+use heck::ToSnakeCase as _;
 use proc_macro2::TokenStream as TokenStream2;
 use proc_macro_error::abort_call_site;
 use quote::{
@@ -35,32 +26,43 @@ use scale_info::{
     TypeDef,
 };
 
+/// Generate functions which create storage addresses from the provided pallet's metadata.
+/// These addresses can be used to access and iterate over storage values.
+///
+/// # Arguments
+///
+/// - `metadata` - Runtime metadata from which the storages are generated.
+/// - `type_gen` - The type generator containing all types defined by metadata.
+/// - `pallet` - Pallet metadata from which the storages are generated.
+/// - `types_mod_ident` - The ident of the base module that we can use to access the generated types from.
 pub fn generate_storage(
+    metadata: &RuntimeMetadataV14,
     type_gen: &TypeGenerator,
     pallet: &PalletMetadata<PortableForm>,
-    storage: &PalletStorageMetadata<PortableForm>,
     types_mod_ident: &syn::Ident,
+    crate_path: &CratePath,
 ) -> TokenStream2 {
-    let (storage_structs, storage_fns): (Vec<_>, Vec<_>) = storage
+    let storage = if let Some(ref storage) = pallet.storage {
+        storage
+    } else {
+        return quote!()
+    };
+
+    let storage_fns: Vec<_> = storage
         .entries
         .iter()
-        .map(|entry| generate_storage_entry_fns(type_gen, pallet, entry))
-        .unzip();
+        .map(|entry| {
+            generate_storage_entry_fns(metadata, type_gen, pallet, entry, crate_path)
+        })
+        .collect();
 
     quote! {
         pub mod storage {
             use super::#types_mod_ident;
-            #( #storage_structs )*
 
-            pub struct StorageApi<'a, T: ::subxt::Config> {
-                client: &'a ::subxt::Client<T>,
-            }
+            pub struct StorageApi;
 
-            impl<'a, T: ::subxt::Config> StorageApi<'a, T> {
-                pub fn new(client: &'a ::subxt::Client<T>) -> Self {
-                    Self { client }
-                }
-
+            impl StorageApi {
                 #( #storage_fns )*
             }
         }
@@ -68,18 +70,14 @@ pub fn generate_storage(
 }
 
 fn generate_storage_entry_fns(
+    metadata: &RuntimeMetadataV14,
     type_gen: &TypeGenerator,
     pallet: &PalletMetadata<PortableForm>,
     storage_entry: &StorageEntryMetadata<PortableForm>,
-) -> (TokenStream2, TokenStream2) {
-    let entry_struct_ident = format_ident!("{}", storage_entry.name);
-    let (fields, entry_struct, constructor, key_impl) = match storage_entry.ty {
-        StorageEntryType::Plain(_) => {
-            let entry_struct = quote!( pub struct #entry_struct_ident; );
-            let constructor = quote!( #entry_struct_ident );
-            let key_impl = quote!(::subxt::StorageEntryKey::Plain);
-            (vec![], entry_struct, constructor, key_impl)
-        }
+    crate_path: &CratePath,
+) -> TokenStream2 {
+    let (fields, key_impl) = match storage_entry.ty {
+        StorageEntryType::Plain(_) => (vec![], quote!(vec![])),
         StorageEntryType::Map {
             ref key,
             ref hashers,
@@ -99,7 +97,7 @@ fn generate_storage_entry_fns(
                         StorageHasher::Identity => "Identity",
                     };
                     let hasher = format_ident!("{}", hasher);
-                    quote!( ::subxt::StorageHasher::#hasher )
+                    quote!( #crate_path::storage::address::StorageHasher::#hasher )
                 })
                 .collect::<Vec<_>>();
             match key_ty.type_def() {
@@ -110,114 +108,153 @@ fn generate_storage_entry_fns(
                         .enumerate()
                         .map(|(i, f)| {
                             let field_name = format_ident!("_{}", syn::Index::from(i));
-                            let field_type = type_gen.resolve_type_path(f.id(), &[]);
+                            let field_type = type_gen.resolve_type_path(f.id());
                             (field_name, field_type)
                         })
                         .collect::<Vec<_>>();
-                    // toddo: [AJ] use unzip here?
-                    let tuple_struct_fields =
-                        fields.iter().map(|(_, field_type)| field_type);
-                    let field_names = fields.iter().map(|(field_name, _)| field_name);
-                    let entry_struct = quote! {
-                        pub struct #entry_struct_ident( #( #tuple_struct_fields ),* );
-                    };
-                    let constructor =
-                        quote!( #entry_struct_ident( #( #field_names ),* ) );
-                    let keys = (0..tuple.fields().len()).into_iter().zip(hashers).map(
-                        |(field, hasher)| {
-                            let index = syn::Index::from(field);
-                            quote!( ::subxt::StorageMapKey::new(&self.#index, #hasher) )
-                        },
-                    );
-                    let key_impl = quote! {
-                        ::subxt::StorageEntryKey::Map(
+
+                    let key_impl = if hashers.len() == fields.len() {
+                        // If the number of hashers matches the number of fields, we're dealing with
+                        // something shaped like a StorageNMap, and each field should be hashed separately
+                        // according to the corresponding hasher.
+                        let keys = hashers
+                            .into_iter()
+                            .zip(&fields)
+                            .map(|(hasher, (field_name, _))| {
+                                quote!( #crate_path::storage::address::StorageMapKey::new(#field_name.borrow(), #hasher) )
+                            });
+                        quote! {
                             vec![ #( #keys ),* ]
+                        }
+                    } else if hashers.len() == 1 {
+                        // If there is one hasher, then however many fields we have, we want to hash a
+                        // tuple of them using the one hasher we're told about. This corresponds to a
+                        // StorageMap.
+                        let hasher = hashers.get(0).expect("checked for 1 hasher");
+                        let items =
+                            fields.iter().map(|(field_name, _)| quote!( #field_name ));
+                        quote! {
+                            vec![ #crate_path::storage::address::StorageMapKey::new(&(#( #items.borrow() ),*), #hasher) ]
+                        }
+                    } else {
+                        // If we hit this condition, we don't know how to handle the number of hashes vs fields
+                        // that we've been handed, so abort.
+                        abort_call_site!(
+                            "Number of hashers ({}) does not equal 1 for StorageMap, or match number of fields ({}) for StorageNMap",
+                            hashers.len(),
+                            fields.len()
                         )
                     };
-                    (fields, entry_struct, constructor, key_impl)
+
+                    (fields, key_impl)
                 }
                 _ => {
-                    let ty_path = type_gen.resolve_type_path(key.id(), &[]);
-                    let fields = vec![(format_ident!("_0"), ty_path.clone())];
-                    let entry_struct = quote! {
-                        pub struct #entry_struct_ident( pub #ty_path );
-                    };
-                    let constructor = quote!( #entry_struct_ident(_0) );
+                    let ty_path = type_gen.resolve_type_path(key.id());
+                    let fields = vec![(format_ident!("_0"), ty_path)];
                     let hasher = hashers.get(0).unwrap_or_else(|| {
                         abort_call_site!("No hasher found for single key")
                     });
                     let key_impl = quote! {
-                        ::subxt::StorageEntryKey::Map(
-                            vec![ ::subxt::StorageMapKey::new(&self.0, #hasher) ]
-                        )
+                        vec![ #crate_path::storage::address::StorageMapKey::new(_0.borrow(), #hasher) ]
                     };
-                    (fields, entry_struct, constructor, key_impl)
+                    (fields, key_impl)
                 }
             }
         }
     };
+
     let pallet_name = &pallet.name;
     let storage_name = &storage_entry.name;
+    let storage_hash =
+        subxt_metadata::get_storage_hash(metadata, pallet_name, storage_name)
+            .unwrap_or_else(|_| {
+                abort_call_site!(
+                    "Metadata information for the storage entry {}_{} could not be found",
+                    pallet_name,
+                    storage_name
+                )
+            });
+
     let fn_name = format_ident!("{}", storage_entry.name.to_snake_case());
-    let fn_name_iter = format_ident!("{}_iter", fn_name);
     let storage_entry_ty = match storage_entry.ty {
         StorageEntryType::Plain(ref ty) => ty,
         StorageEntryType::Map { ref value, .. } => value,
     };
-    let storage_entry_value_ty = type_gen.resolve_type_path(storage_entry_ty.id(), &[]);
-    let (return_ty, fetch) = match storage_entry.modifier {
-        StorageEntryModifier::Default => {
-            (quote!( #storage_entry_value_ty ), quote!(fetch_or_default))
-        }
-        StorageEntryModifier::Optional => {
-            (
-                quote!( ::core::option::Option<#storage_entry_value_ty> ),
-                quote!(fetch),
-            )
-        }
+    let storage_entry_value_ty = type_gen.resolve_type_path(storage_entry_ty.id());
+
+    let docs = &storage_entry.docs;
+    let docs_token = quote! { #( #[doc = #docs ] )* };
+
+    let key_args = fields.iter().map(|(field_name, field_type)| {
+        // The field type is translated from `std::vec::Vec<T>` to `[T]`. We apply
+        // AsRef to all types, so this just makes it a little more ergonomic.
+        //
+        // TODO [jsdw]: Support mappings like `String -> str` too for better borrow
+        // ergonomics.
+        let field_ty = match field_type.vec_type_param() {
+            Some(ty) => quote!([#ty]),
+            _ => quote!(#field_type),
+        };
+        quote!( #field_name: impl ::std::borrow::Borrow<#field_ty> )
+    });
+
+    let is_map_type = matches!(storage_entry.ty, StorageEntryType::Map { .. });
+
+    // Is the entry iterable?
+    let is_iterable_type = if is_map_type {
+        quote!(#crate_path::storage::address::Yes)
+    } else {
+        quote!(())
     };
 
-    let storage_entry_type = quote! {
-        #entry_struct
-
-        impl ::subxt::StorageEntry for #entry_struct_ident {
-            const PALLET: &'static str = #pallet_name;
-            const STORAGE: &'static str = #storage_name;
-            type Value = #storage_entry_value_ty;
-            fn key(&self) -> ::subxt::StorageEntryKey {
-                #key_impl
-            }
-        }
+    let has_default_value = match storage_entry.modifier {
+        StorageEntryModifier::Default => true,
+        StorageEntryModifier::Optional => false,
     };
 
-    let client_iter_fn = if matches!(storage_entry.ty, StorageEntryType::Map { .. }) {
+    // Does the entry have a default value?
+    let is_defaultable_type = if has_default_value {
+        quote!(#crate_path::storage::address::Yes)
+    } else {
+        quote!(())
+    };
+
+    // If the item is a map, we want a way to access the root entry to do things like iterate over it,
+    // so expose a function to create this entry, too:
+    let root_entry_fn = if is_map_type {
+        let fn_name_root = format_ident!("{}_root", fn_name);
         quote! (
-            pub async fn #fn_name_iter(
+            #docs_token
+            pub fn #fn_name_root(
                 &self,
-                hash: ::core::option::Option<T::Hash>,
-            ) -> ::core::result::Result<::subxt::KeyIter<'a, T, #entry_struct_ident>, ::subxt::Error> {
-                self.client.storage().iter(hash).await
+            ) -> #crate_path::storage::address::StaticStorageAddress::<#crate_path::metadata::DecodeStaticType<#storage_entry_value_ty>, (), #is_defaultable_type, #is_iterable_type> {
+                #crate_path::storage::address::StaticStorageAddress::new(
+                    #pallet_name,
+                    #storage_name,
+                    Vec::new(),
+                    [#(#storage_hash,)*]
+                )
             }
         )
     } else {
         quote!()
     };
 
-    let key_args = fields
-        .iter()
-        .map(|(field_name, field_type)| quote!( #field_name: #field_type ));
-    let client_fns = quote! {
-        pub async fn #fn_name(
+    quote! {
+        // Access a specific value from a storage entry
+        #docs_token
+        pub fn #fn_name(
             &self,
             #( #key_args, )*
-            hash: ::core::option::Option<T::Hash>,
-        ) -> ::core::result::Result<#return_ty, ::subxt::Error> {
-            let entry = #constructor;
-            self.client.storage().#fetch(&entry, hash).await
+        ) -> #crate_path::storage::address::StaticStorageAddress::<#crate_path::metadata::DecodeStaticType<#storage_entry_value_ty>, #crate_path::storage::address::Yes, #is_defaultable_type, #is_iterable_type> {
+            #crate_path::storage::address::StaticStorageAddress::new(
+                #pallet_name,
+                #storage_name,
+                #key_impl,
+                [#(#storage_hash,)*]
+            )
         }
 
-        #client_iter_fn
-    };
-
-    (storage_entry_type, client_fns)
+        #root_entry_fn
+    }
 }
